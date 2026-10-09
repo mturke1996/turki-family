@@ -1,4 +1,4 @@
-const CACHE_NAME = 'daftar-alazima-v1'
+const CACHE_NAME = 'turki-family-v2'
 const APP_SHELL = ['/', '/manifest.webmanifest', '/pwa-icon.svg']
 
 self.addEventListener('install', (event) => {

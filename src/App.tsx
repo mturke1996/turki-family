@@ -1,305 +1,212 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
-  Activity, ArrowDownToLine, ArrowLeft, CalendarDays, Check, CheckCheck, ChevronDown,
-  ChevronLeft, CircleHelp, ClipboardCheck, Clock3, FileSpreadsheet, HeartHandshake,
-  ListFilter, Menu, MessageCircle, MoreHorizontal, Phone, PhoneMissed, Plus, Search,
-  Share2, ShieldCheck, Sparkles, Users, UserRoundPlus, X,
+  Activity, ArrowDownToLine, ArrowDownUp, Check, CheckCheck, ChevronDown,
+  CircleHelp, Clock3, HeartHandshake, ListFilter,
+  MessageCircle, MoreHorizontal, Phone, PhoneMissed, Plus, RefreshCw, Search,
+  Share2, ShieldCheck, Users, X,
 } from 'lucide-react'
-import { ACCESS_CODE_KEY, downloadCsv, findDuplicate, fullName, loadDemoActivity, loadDemoGuests, normalizePhone, resetDemoData, saveDemoData } from './lib/data'
-import { isCloudConfigured, supabase } from './lib/supabase'
+import { downloadCsv, findDuplicate, fullName, matchesGuestQuery, normalizePhone } from './lib/data'
+import { FAMILY_ACCESS_CODE, supabase } from './lib/supabase'
 import { FAMILY_CONTACTS, OUTCOME_META, STATUS_META, type ContactOutcome, type Family, type FamilyContact, type Guest, type GuestActivity, type GuestStatus } from './lib/types'
 
 type GuestDraft = Pick<Guest, 'first_name' | 'last_name' | 'phone' | 'family_count' | 'invited_by'>
 type Filter = GuestStatus | 'all'
+type SortBy = 'updated' | 'name' | 'group' | 'inviter' | 'status'
+const APP_NAME = 'أفراح عائلة التركي'
 const filters: { value: Filter; label: string }[] = [
   { value: 'all', label: 'الكل' },
   { value: 'not_contacted', label: 'بانتظار العزيمة' },
   { value: 'invited', label: 'تمت العزيمة' },
   { value: 'no_answer', label: 'لم يرد' },
 ]
-const demoFamily: Family = { id: 'demo-family', name: 'عائلة السالم', realtime_topic: '' }
-
-function initialAccessCode(): string {
-  try {
-    const fromLink = new URLSearchParams(window.location.hash.slice(1)).get('join')
-    return fromLink || localStorage.getItem(ACCESS_CODE_KEY) || ''
-  } catch { return '' }
-}
+const partySize = (items: Guest[]) => items.reduce((sum, guest) => sum + guest.family_count, 0)
 
 function explainError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error)
+  const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error)
   const text = message.toLowerCase()
-  if (text.includes('invalid_access_code')) return 'رمز الدفتر غير صحيح. تحقق من الرمز وجرّب مرة أخرى.'
-  if (text.includes('guest_duplicate')) return 'هذا الاسم أو الرقم مسجل من قبل. افتح اسمه الموجود لتعديل بياناته.'
-  if (text.includes('invalid_phone')) return 'تأكد من رقم الهاتف؛ أدخل ستة أرقام على الأقل أو اتركه فارغاً.'
-  if (text.includes('invalid_family_name')) return 'اكتب اسم العائلة (حرفان على الأقل).'
-  if (text.includes('invalid_guest_name')) return 'اكتب اسم الضيف (حرف واحد على الأقل).'
+  if (text.includes('invalid_access_code')) return 'تعذر فتح دفتر العائلة. أعد المحاولة.'
+  if (text.includes('guest_duplicate')) return 'هذا الاسم أو الرقم مسجل من قبل. افتح الاسم الموجود لتعديل بياناته.'
+  if (text.includes('invalid_phone')) return 'تأكد من رقم الهاتف أو اتركه فارغاً.'
+  if (text.includes('invalid_guest_name')) return 'اكتب اسم المعزوم.'
   if (text.includes('invalid_family_count')) return 'عدد أفراد المجموعة يجب أن يكون من 1 إلى 500.'
-  if (text.includes('failed to fetch') || text.includes('network')) return 'تعذر الاتصال. تحقق من الإنترنت وإعداد الخدمة.'
-  if (text.includes('jwt') || text.includes('api key')) return 'إعداد Supabase غير مكتمل. راجع رابط المشروع ومفتاحه.'
-  return message || 'حدث خطأ. حاول مرة أخرى.'
+  if (text.includes('could not find the function') || text.includes('schema cache')) return 'لم يكتمل تجهيز قاعدة البيانات بعد. أعد المحاولة بعد تفعيل الدفتر.'
+  if (text.includes('failed to fetch') || text.includes('network')) return 'تعذر الاتصال بالدفتر. تحقق من الإنترنت وأعد المحاولة.'
+  if (text.includes('jwt') || text.includes('api key')) return 'تعذر الاتصال بقاعدة البيانات. يلزم مراجعة إعداد الربط.'
+  return message || 'تعذر حفظ التغيير. أعد المحاولة.'
 }
 
 function initials(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean)
   return (words[0]?.[0] ?? '؟') + (words[1]?.[0] ?? '')
 }
-
 function shortDate(value: string): string {
   return new Intl.DateTimeFormat('ar-LY', { day: 'numeric', month: 'short' }).format(new Date(value))
 }
-
 function formatStamp(value?: string): string {
-  if (!value) return 'لا يوجد تحديث بعد'
+  if (!value) return '—'
   return new Intl.DateTimeFormat('ar-LY', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }).format(new Date(value))
 }
 
 function App() {
-  const demo = !isCloudConfigured
-  const [accessCode, setAccessCode] = useState(initialAccessCode)
-  const [family, setFamily] = useState<Family | null>(demo ? demoFamily : null)
-  const [guests, setGuests] = useState<Guest[]>(() => demo ? loadDemoGuests() : [])
-  const [activity, setActivity] = useState<GuestActivity[]>(() => demo ? loadDemoActivity() : [])
-  const [loading, setLoading] = useState(!demo && Boolean(initialAccessCode()))
+  const [family, setFamily] = useState<Family | null>(null)
+  const [guests, setGuests] = useState<Guest[]>([])
+  const [activity, setActivity] = useState<GuestActivity[]>([])
+  const [loading, setLoading] = useState(true)
   const [realtime, setRealtime] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
   const [error, setError] = useState('')
   const [toast, setToast] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
-  const [inviterFilter, setInviterFilter] = useState<FamilyContact | 'all'>('all')
-  const [sortBy, setSortBy] = useState<'updated' | 'name' | 'group' | 'inviter'>('updated')
+  const [inviterFilter, setInviterFilter] = useState<FamilyContact | 'all' | ''>('all')
+  const [sortBy, setSortBy] = useState<SortBy>('updated')
+  const [descending, setDescending] = useState(true)
   const [search, setSearch] = useState('')
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [visibleLimit, setVisibleLimit] = useState(50)
   const [dialog, setDialog] = useState<'add' | 'edit' | 'details' | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [pendingIds, setPendingIds] = useState<Set<string>>(new Set())
+  const pendingRef = useRef(new Set<string>())
+  const refreshSequence = useRef(0)
   const selected = guests.find((guest) => guest.id === selectedId) ?? null
   const selectedEvents = useMemo(() => activity.filter((entry) => entry.guest_id === selectedId).sort((a, b) => b.created_at.localeCompare(a.created_at)), [activity, selectedId])
 
-  const refreshCloudData = useCallback(async (code = accessCode) => {
-    if (!supabase || !code) return
-    const [guestResult, activityResult] = await Promise.all([
-      supabase.rpc('list_guests', { p_access_code: code }),
-      supabase.rpc('list_guest_activities', { p_access_code: code }),
-    ])
-    if (guestResult.error) throw guestResult.error
-    if (activityResult.error) throw activityResult.error
-    setGuests((guestResult.data ?? []) as Guest[])
-    setActivity((activityResult.data ?? []) as GuestActivity[])
-  }, [accessCode])
+  const refreshCloudData = useCallback(async () => {
+    if (!supabase) throw new Error('تعذر الاتصال بقاعدة البيانات.')
+    const sequence = ++refreshSequence.current
+    const { data, error: snapshotError } = await supabase.rpc('get_turki_snapshot', { p_access_code: FAMILY_ACCESS_CODE })
+    if (snapshotError) throw snapshotError
+    if (sequence === refreshSequence.current) {
+      setGuests((data?.guests ?? []) as Guest[])
+      setActivity((data?.activities ?? []) as GuestActivity[])
+    }
+  }, [])
 
   useEffect(() => {
-    if (demo || !accessCode || !supabase) return
     let active = true
-    setLoading(true)
-    setError('')
+    setLoading(true); setError('')
     void (async () => {
-      const { data, error: familyError } = await supabase.rpc('get_family', { p_access_code: accessCode })
-      if (!active) return
-      if (familyError) {
-        setError(explainError(familyError)); setLoading(false); setFamily(null)
-        localStorage.removeItem(ACCESS_CODE_KEY); setAccessCode('')
-        const clean = new URL(window.location.href); clean.hash = ''; window.history.replaceState({}, '', clean)
-        return
-      }
-      const row = Array.isArray(data) ? data[0] : data
-      if (!row) { setError('رمز الدفتر غير موجود.'); setLoading(false); return }
-      const nextFamily = row as Family
-      setFamily(nextFamily)
-      try { await refreshCloudData(accessCode) }
-      catch (loadError) { if (active) setError(explainError(loadError)) }
-      if (active) setLoading(false)
-      const clean = new URL(window.location.href); clean.hash = ''; window.history.replaceState({}, '', clean)
+      try {
+        if (!supabase) throw new Error('تعذر الاتصال بقاعدة البيانات.')
+        const { data, error: bookError } = await supabase.rpc('open_turki_book')
+        if (bookError) throw bookError
+        if (!active) return
+        const row = Array.isArray(data) ? data[0] : data
+        if (!row) throw new Error('تعذر فتح دفتر العائلة.')
+        setFamily(row as Family)
+        await refreshCloudData()
+      } catch (loadError) { if (active) setError(explainError(loadError)) }
+      finally { if (active) setLoading(false) }
     })()
     return () => { active = false }
-  }, [accessCode, demo, refreshCloudData])
+  }, [refreshCloudData, reloadKey])
 
   useEffect(() => {
-    if (demo || !family?.realtime_topic || !supabase) return
+    if (!family?.realtime_topic || !supabase) return
     const client = supabase
+    const recover = () => {
+      if (document.visibilityState === 'visible') void refreshCloudData().catch((loadError: unknown) => setError(explainError(loadError)))
+    }
     const channel = client.channel(family.realtime_topic)
-      .on('broadcast', { event: 'family-change' }, () => {
-        void refreshCloudData().catch((loadError: unknown) => setError(explainError(loadError)))
-      })
+      .on('broadcast', { event: 'family-change' }, recover)
       .subscribe((status) => setRealtime(status === 'SUBSCRIBED'))
-    // A slow refresh also recovers after a phone sleeps or changes networks.
-    const recovery = window.setInterval(() => {
-      if (document.visibilityState === 'visible') void refreshCloudData().catch(() => undefined)
-    }, 20000)
-    return () => { window.clearInterval(recovery); setRealtime(false); void client.removeChannel(channel) }
-  }, [demo, family?.realtime_topic, refreshCloudData])
+    const recovery = window.setInterval(recover, 20000)
+    window.addEventListener('online', recover)
+    document.addEventListener('visibilitychange', recover)
+    return () => { window.clearInterval(recovery); window.removeEventListener('online', recover); document.removeEventListener('visibilitychange', recover); setRealtime(false); void client.removeChannel(channel) }
+  }, [family?.realtime_topic, refreshCloudData])
 
-  useEffect(() => { if (demo) saveDemoData(guests, activity) }, [activity, demo, guests])
   useEffect(() => {
     if (!toast) return
     const timer = window.setTimeout(() => setToast(''), 3200)
     return () => window.clearTimeout(timer)
   }, [toast])
+  useEffect(() => { setVisibleLimit(50) }, [filter, inviterFilter, search, sortBy, descending])
 
-  const filtered = useMemo(() => {
-    const query = search.trim().toLocaleLowerCase('ar-LY')
-    return guests.filter((guest) => {
-      const matchesStatus = filter === 'all' || guest.status === filter
-      const matchesQuery = !query || [fullName(guest), guest.phone, guest.invited_by].some((value) => value.toLocaleLowerCase('ar-LY').includes(query))
-      const matchesInviter = inviterFilter === 'all' || guest.invited_by === inviterFilter
-      return matchesStatus && matchesQuery && matchesInviter
-    }).sort((a, b) => {
-      if (sortBy === 'name') return fullName(a).localeCompare(fullName(b), 'ar')
-      if (sortBy === 'group') return b.family_count - a.family_count || fullName(a).localeCompare(fullName(b), 'ar')
-      if (sortBy === 'inviter') return FAMILY_CONTACTS.indexOf(a.invited_by as FamilyContact) - FAMILY_CONTACTS.indexOf(b.invited_by as FamilyContact) || fullName(a).localeCompare(fullName(b), 'ar')
-      return b.updated_at.localeCompare(a.updated_at)
-    })
-  }, [filter, guests, inviterFilter, search, sortBy])
-
+  const filtered = useMemo(() => guests.filter((guest) =>
+    (filter === 'all' || guest.status === filter) &&
+    (inviterFilter === 'all' || guest.invited_by === inviterFilter) && matchesGuestQuery(guest, search),
+  ).sort((a, b) => {
+    let comparison = 0
+    if (sortBy === 'name') comparison = fullName(a).localeCompare(fullName(b), 'ar')
+    else if (sortBy === 'group') comparison = a.family_count - b.family_count
+    else if (sortBy === 'inviter') comparison = (FAMILY_CONTACTS as readonly string[]).indexOf(a.invited_by) - (FAMILY_CONTACTS as readonly string[]).indexOf(b.invited_by)
+    else if (sortBy === 'status') comparison = ['not_contacted', 'no_answer', 'invited'].indexOf(a.status) - ['not_contacted', 'no_answer', 'invited'].indexOf(b.status)
+    else comparison = a.updated_at.localeCompare(b.updated_at)
+    return (descending ? -comparison : comparison) || fullName(a).localeCompare(fullName(b), 'ar')
+  }), [descending, filter, guests, inviterFilter, search, sortBy])
+  const visibleGuests = filtered.slice(0, visibleLimit)
   const count = (status: GuestStatus) => guests.filter((guest) => guest.status === status).length
-  const partySize = (items: Guest[]) => items.reduce((sum, guest) => sum + guest.family_count, 0)
-  const latestUpdate = guests.reduce((latest, guest) => guest.updated_at > latest ? guest.updated_at : latest, '')
-
-  const saveAccessCode = (code: string, nextFamily: Family) => {
-    const normalized = code.trim().toLowerCase()
-    localStorage.setItem(ACCESS_CODE_KEY, normalized)
-    setAccessCode(normalized)
-    setFamily(nextFamily)
-    setError('')
-    const clean = new URL(window.location.href); clean.hash = ''; window.history.replaceState({}, '', clean)
-  }
+  const hasFilters = Boolean(search || filter !== 'all' || inviterFilter !== 'all')
+  const clearFilters = () => { setFilter('all'); setInviterFilter('all'); setSearch('') }
+  const openAdd = () => { if (family) { setSelectedId(null); setError(''); setDialog('add') } }
+  const openDetails = (guest: Guest) => { setSelectedId(guest.id); setDialog('details'); setError('') }
 
   const saveGuest = async (draft: GuestDraft, guestId?: string): Promise<boolean> => {
     const duplicate = findDuplicate(guests, draft.first_name, draft.last_name, draft.phone, guestId)
-    if (duplicate) {
-      setError(`هذا الضيف موجود بالفعل: «${fullName(duplicate)}»${duplicate.phone ? ` · ${duplicate.phone}` : ''}. لن نضيفه مرة ثانية.`)
-      return false
-    }
-    if (draft.phone && normalizePhone(draft.phone).length < 6) { setError('رقم الهاتف غير مكتمل. اتركه فارغاً أو أدخل ستة أرقام على الأقل.'); return false }
+    if (duplicate) { setError(`المعزوم «${fullName(duplicate)}» موجود بالفعل بنفس الاسم أو الهاتف.`); return false }
+    if (draft.phone && normalizePhone(draft.phone).length < 6) { setError('رقم الهاتف غير مكتمل. اتركه فارغاً أو أكمل الرقم.'); return false }
     setError('')
-    if (demo) {
-      const now = new Date().toISOString()
-      if (guestId) {
-        setGuests((current) => current.map((guest) => guest.id === guestId ? { ...guest, ...draft, updated_at: now } : guest))
-        setToast('تم تعديل بيانات الضيف')
-      } else {
-        const guest: Guest = { id: crypto.randomUUID(), family_id: demoFamily.id, ...draft, status: 'not_contacted', created_at: now, updated_at: now, latest_note: '' }
-        setGuests((current) => [guest, ...current])
-        setActivity((current) => [{ id: crypto.randomUUID(), family_id: demoFamily.id, guest_id: guest.id, outcome: 'added', note: 'أُضيف إلى دفتر العائلة', actor_name: 'العائلة', created_at: now }, ...current])
-        setToast('أُضيف الاسم إلى القائمة')
-      }
-      setDialog(null)
+    try {
+      if (!supabase || !family) throw new Error('تعذر الاتصال بالدفتر.')
+      const { data, error: saveError } = await supabase.rpc('save_guest', {
+        p_access_code: FAMILY_ACCESS_CODE, p_guest_id: guestId ?? null,
+        p_first_name: draft.first_name, p_last_name: draft.last_name, p_phone: draft.phone,
+        p_family_count: draft.family_count, p_invited_by: draft.invited_by,
+      })
+      if (saveError) throw saveError
+      const result = Array.isArray(data) ? data[0] : data
+      if (result?.was_duplicate) { setError(`المعزوم مسجل من قبل بنفس ${result.duplicate_by === 'phone' ? 'رقم الهاتف' : 'الاسم'}.`); return false }
+      setDialog(null); setToast(guestId ? 'تم حفظ التعديل' : 'تمت إضافة المعزوم')
+      await refreshCloudData().catch(() => setError('تم الحفظ. تعذر تحديث القائمة؛ اضغط تحديث.'))
       return true
-    }
-    if (!supabase || !accessCode) return false
-    const { data, error: saveError } = await supabase.rpc('save_guest', {
-      p_access_code: accessCode, p_guest_id: guestId ?? null,
-      p_first_name: draft.first_name, p_last_name: draft.last_name, p_phone: draft.phone,
-      p_family_count: draft.family_count, p_invited_by: draft.invited_by,
-    })
-    if (saveError) { setError(explainError(saveError)); return false }
-    const result = Array.isArray(data) ? data[0] : data
-    if (result?.was_duplicate) {
-      const existing = guests.find((guest) => guest.id === result.guest_id)
-      setError(`الضيف موجود${existing ? ` باسم «${fullName(existing)}»` : ''} حسب ${result.duplicate_by === 'phone' ? 'رقم الهاتف' : 'الاسم'}.`)
-      return false
-    }
-    try { await refreshCloudData() } catch (loadError) { setError(explainError(loadError)); return false }
-    setDialog(null); setToast(guestId ? 'تم تعديل بيانات الضيف' : 'أُضيف الاسم وظهر لدى العائلة')
-    return true
+    } catch (saveError) { setError(explainError(saveError)); return false }
   }
 
   const recordContact = async (guest: Guest, outcome: ContactOutcome, note: string): Promise<boolean> => {
-    if (demo) {
-      const now = new Date().toISOString()
-      const event: GuestActivity = { id: crypto.randomUUID(), family_id: demoFamily.id, guest_id: guest.id, outcome, note, actor_name: 'العائلة', created_at: now }
-      setActivity((current) => [event, ...current])
-      setGuests((current) => current.map((item) => item.id === guest.id ? { ...item, status: outcome === 'note' ? item.status : outcome, latest_note: note || item.latest_note, updated_at: now } : item))
+    if (pendingRef.current.has(guest.id)) return false
+    pendingRef.current.add(guest.id); setPendingIds(new Set(pendingRef.current)); setError('')
+    try {
+      if (!supabase || !family) throw new Error('تعذر الاتصال بالدفتر.')
+      const { error: saveError } = await supabase.rpc('record_guest_activity', {
+        p_access_code: FAMILY_ACCESS_CODE, p_guest_id: guest.id, p_outcome: outcome, p_note: note,
+      })
+      if (saveError) throw saveError
       setToast(outcome === 'note' ? 'تم حفظ الملاحظة' : 'تم تحديث حالة العزيمة')
+      await refreshCloudData().catch(() => setError('تم الحفظ. تعذر تحديث القائمة؛ اضغط تحديث.'))
       return true
-    }
-    if (!supabase || !accessCode) return false
-    const { error: saveError } = await supabase.rpc('record_guest_activity', {
-      p_access_code: accessCode, p_guest_id: guest.id, p_outcome: outcome, p_note: note,
-    })
-    if (saveError) { setError(explainError(saveError)); return false }
-    try { await refreshCloudData() } catch (loadError) { setError(explainError(loadError)); return false }
-    setToast(outcome === 'note' ? 'تم حفظ الملاحظة لدى العائلة' : 'تم تحديث حالة العزيمة لدى العائلة')
-    return true
-  }
-
-  const createFamily = async (name: string): Promise<boolean> => {
-    if (!supabase) return false
-    const { data, error: createError } = await supabase.rpc('create_family', { p_name: name })
-    if (createError) { setError(explainError(createError)); return false }
-    const row = Array.isArray(data) ? data[0] : data
-    if (!row?.access_code) { setError('تعذر إنشاء الدفتر. حاول مرة أخرى.'); return false }
-    saveAccessCode(row.access_code, row as Family)
-    setToast('أُنشئ الدفتر. شارك رمزه مع العائلة')
-    return true
-  }
-
-  const joinFamily = async (code: string): Promise<boolean> => {
-    if (!supabase) return false
-    const normalized = code.trim().toLowerCase()
-    const { data, error: joinError } = await supabase.rpc('get_family', { p_access_code: normalized })
-    if (joinError) { setError(explainError(joinError)); return false }
-    const row = Array.isArray(data) ? data[0] : data
-    if (!row) { setError('لم نعثر على دفتر بهذا الرمز. راجع الرمز الذي أرسلته العائلة.'); return false }
-    saveAccessCode(normalized, row as Family)
-    setToast(`أنت الآن في ${row.name}`)
-    return true
+    } catch (saveError) { setError(explainError(saveError)); return false }
+    finally { pendingRef.current.delete(guest.id); setPendingIds(new Set(pendingRef.current)) }
   }
 
   const shareFamily = async () => {
-    if (!family || demo || !accessCode) return
-    const inviteUrl = new URL(window.location.href)
-    inviteUrl.hash = new URLSearchParams({ join: accessCode }).toString()
+    const url = new URL(window.location.href); url.hash = ''
     try {
-      if (navigator.share) await navigator.share({ title: `دفتر ${family.name}`, text: `افتح دفتر عزيمة ${family.name} المشترك.`, url: inviteUrl.toString() })
-      else { await navigator.clipboard.writeText(inviteUrl.toString()); setToast('نُسخ رابط الانضمام') }
+      if (navigator.share) await navigator.share({ title: APP_NAME, url: url.toString() })
+      else { await navigator.clipboard.writeText(url.toString()); setToast('تم نسخ رابط العائلة') }
     } catch (shareError) {
       if (shareError instanceof Error && shareError.name === 'AbortError') return
-      try { await navigator.clipboard.writeText(inviteUrl.toString()); setToast('نُسخ رابط الانضمام') }
-      catch { setError(`رمز الدفتر: ${accessCode}`) }
+      setError('تعذرت المشاركة. انسخ رابط الصفحة وأرسله للعائلة.')
     }
   }
 
-  const openDetails = (guest: Guest) => { setSelectedId(guest.id); setDialog('details'); setError('') }
-  const openAdd = () => { setSelectedId(null); setError(''); setDialog('add') }
-
-  if (!demo && loading) return <LoadingScreen />
-  if (!demo && !accessCode) return <FamilySetup onCreate={createFamily} onJoin={joinFamily} error={error} clearError={() => setError('')} />
-
-  return <div className="app-shell" dir="rtl">
-    <aside className={`sidebar ${mobileMenuOpen ? 'sidebar-open' : ''}`} aria-label="القائمة">
-      <div className="brand-lockup"><div className="brand-mark"><ClipboardCheck size={21} /></div><div><div className="brand-name">دفتر العزيمة</div><div className="brand-caption">سجل عائلتكم للعرس</div></div><button className="icon-button sidebar-close" aria-label="إغلاق القائمة" onClick={() => setMobileMenuOpen(false)}><X size={18} /></button></div>
-      <div className="sidebar-divider" />
-      <div className="side-section-label">دفتر العائلة</div>
-      <div className="family-switcher"><div className="family-avatar"><HeartHandshake size={19} /></div><div className="family-copy"><strong>{family?.name}</strong><span>{demo ? 'عرض على هذا الجهاز' : realtime ? 'متصل ومزامَن' : 'قائمة مشتركة'}</span></div><ChevronDown size={16} className="family-chevron" /></div>
-      <nav className="side-nav" aria-label="التنقل"><button className="side-nav-item active" onClick={() => { document.getElementById('guest-list')?.scrollIntoView({ behavior: 'smooth' }); setMobileMenuOpen(false) }}><Users size={18} /><span>كل المعازيم</span><span className="nav-count">{guests.length.toLocaleString('en-US')}</span></button><button className="side-nav-item" onClick={() => { setFilter('no_answer'); document.getElementById('guest-list')?.scrollIntoView({ behavior: 'smooth' }); setMobileMenuOpen(false) }}><Activity size={18} /><span>لم يردوا</span><span className="nav-count subtle">{count('no_answer').toLocaleString('en-US')}</span></button></nav>
-      <div className="side-section-label side-team-title">خيارات «من طرف» <span>٥</span></div>
-      <div className="side-contact-list">{FAMILY_CONTACTS.map((person, index) => <div className="team-member" key={person}><span className={`member-avatar member-color-${index % 3}`}>{person[0]}</span><span className="member-name">{person}</span></div>)}</div>
-      <div className="sidebar-spacer" />
-      <section className="invite-card"><div className="invite-card-top"><span className="invite-icon"><UserRoundPlus size={17} /></span><span>{demo ? 'مزامنة العائلة' : 'شارك الدفتر'}</span></div><p>{demo ? 'اربط Supabase لتفعيل الدفتر المشترك بين الهواتف.' : 'أرسل رابط الدفتر؛ يفتح عندهم مباشرة دون تسجيل دخول.'}</p>{demo ? <div className="invite-code-row"><span className="invite-code">محفوظ محلياً</span></div> : <button className="invite-share" onClick={shareFamily}>مشاركة رابط العائلة <Share2 size={15} /></button>}</section>
-      <div className="sidebar-footer"><button onClick={() => downloadCsv(guests)}><FileSpreadsheet size={17} />تنزيل القائمة <ArrowDownToLine size={15} className="footer-arrow" /></button>{demo ? <button onClick={() => { resetDemoData(); setGuests(loadDemoGuests()); setActivity(loadDemoActivity()); setToast('استعيدت بيانات العرض') }}><Activity size={16} />إعادة بيانات العرض</button> : <button onClick={() => { localStorage.removeItem(ACCESS_CODE_KEY); setAccessCode(''); setFamily(null); setGuests([]); setActivity([]); setError('') }}><HeartHandshake size={16} />تغيير دفتر العائلة</button>}<div className="privacy-line"><ShieldCheck size={14} />{demo ? 'بيانات تجريبية على هذا الجهاز' : 'مشاركة عبر رابط خاص للعائلة'}</div></div>
-    </aside>
-    {mobileMenuOpen && <button className="mobile-scrim" aria-label="إغلاق القائمة" onClick={() => setMobileMenuOpen(false)} />}
-
-    <div className="main-area"><header className="topbar"><button className="mobile-menu icon-button" aria-label="فتح القائمة" onClick={() => setMobileMenuOpen(true)}><Menu size={20} /></button><div className="breadcrumb"><span>دفتر العزيمة</span><ChevronLeft size={14} /><strong>قائمة المعازيم</strong></div><div className="topbar-tools"><div className={`sync-indicator ${demo ? 'demo' : realtime ? 'online' : 'offline'}`}><span className="sync-dot" /><span>{demo ? 'استعراض' : realtime ? 'تحديث مباشر' : 'جاري الربط'}</span></div><div className="top-date"><CalendarDays size={16} />{new Intl.DateTimeFormat('ar-LY', { weekday: 'short', day: 'numeric', month: 'long' }).format(new Date())}</div></div></header>
-      <main className="content-area">
-        {demo && <div className="demo-banner"><Sparkles size={15} /><span><strong>عرض تجريبي</strong> — جرّب الإضافة والتعديل. البيانات محفوظة على هذا الهاتف فقط حتى ربط Supabase.</span><button onClick={() => downloadCsv(guests)} aria-label="تنزيل القائمة التجريبية"><ArrowDownToLine size={16} /></button></div>}
-        {error && <div className="inline-alert" role="alert"><CircleHelp size={17} /><span>{error}</span><button aria-label="إخفاء التنبيه" onClick={() => setError('')}><X size={16} /></button></div>}
-        <section className="page-heading"><div><div className="eyebrow"><span className="eyebrow-line" />ليلة تجمعنا</div><h1>قائمة المعازيم</h1><p>أضف الاسم بسرعة، وسجّل العزيمة أو الملاحظة بسهولة.</p></div><div className="heading-actions"><button className="secondary-button export-button" onClick={() => downloadCsv(guests)}><ArrowDownToLine size={17} /><span>تنزيل</span></button><button className="primary-button" onClick={openAdd}><Plus size={18} /><span>إضافة اسم</span></button></div></section>
-
-        <section className="wedding-panel" aria-label="إجمالي المعازيم"><div className="panel-copy"><div className="panel-kicker"><span className="panel-kicker-dot" />دفتر العائلة <span className="panel-kicker-rule" /> {family?.name}</div><h2>الفرحة تجمعنا،<br className="mobile-break" /> <em>والأسماء عندنا.</em></h2><p>تحديث واحد يظهر للجميع. لا حسابات ولا كلمات مرور.</p><button className="panel-link" onClick={() => document.getElementById('guest-list')?.scrollIntoView({ behavior: 'smooth' })}>عرض الأسماء <ArrowLeft size={15} /></button></div><div className="panel-stamp" aria-hidden="true"><div className="stamp-ring"><span>دعوة العائلة</span><HeartHandshake size={32} strokeWidth={1.4} /><small>ليلة فرح</small></div></div><div className="panel-number"><strong>{partySize(guests).toLocaleString('en-US')}</strong><span>إجمالي المعازيم مع العائلة</span></div><div className="panel-perforation" aria-hidden="true"><span /><span /><span /><span /><span /><span /><span /><span /></div></section>
-
-        <section className="stats-grid" aria-label="ملخص المعازيم"><StatCard icon={<Users size={17} />} label="الأسماء المسجلة" value={guests.length} detail="ضيف رئيسي" tone="ink" /><StatCard icon={<HeartHandshake size={17} />} label="إجمالي المعازيم" value={partySize(guests)} detail="يشمل أفراد عائلاتهم" tone="green" /><StatCard icon={<CheckCheck size={17} />} label="تمت عزيمتهم" value={partySize(guests.filter((guest) => guest.status === 'invited'))} detail={`${count('invited').toLocaleString('en-US')} اسم`} tone="amber" /><StatCard icon={<PhoneMissed size={17} />} label="لم يردوا" value={partySize(guests.filter((guest) => guest.status === 'no_answer'))} detail={`${count('no_answer').toLocaleString('en-US')} اسم يحتاج إعادة اتصال`} tone="rose" /></section>
-
-        <section className="list-section" id="guest-list" aria-labelledby="list-title"><div className="list-heading"><div><div className="list-eyebrow">دفتر الدعوات</div><h2 id="list-title">كل المعازيم <span>{guests.length.toLocaleString('en-US')}</span></h2></div><div className="list-heading-meta"><span className="live-marker" />آخر تحديث {formatStamp(latestUpdate)}</div></div><div className="list-toolbar"><div className="search-box"><Search size={17} /><input type="search" aria-label="ابحث عن معزوم" placeholder="ابحث بالاسم أو الهاتف..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><div className="toolbar-selects"><label className="compact-select"><span className="sr-only">تصفية حسب الشخص</span><select aria-label="تصفية حسب الشخص" value={inviterFilter} onChange={(event) => setInviterFilter(event.target.value as FamilyContact | 'all')}><option value="all">كل الأشخاص</option>{FAMILY_CONTACTS.map((person) => <option key={person} value={person}>من طرف {person}</option>)}</select><ChevronDown size={13} /></label><label className="compact-select"><span className="sr-only">ترتيب القائمة</span><select aria-label="ترتيب القائمة" value={sortBy} onChange={(event) => setSortBy(event.target.value as typeof sortBy)}><option value="updated">الأحدث تحديثاً</option><option value="name">الاسم: أ إلى ي</option><option value="group">أكبر مجموعة</option><option value="inviter">ترتيب حسب الشخص</option></select><ChevronDown size={13} /></label></div><div className="filter-count"><ListFilter size={15} /><span>{filtered.length.toLocaleString('en-US')} اسم</span></div></div><div className="filter-row" role="group" aria-label="تصفية القائمة">{filters.map((option) => <button key={option.value} className={`filter-chip ${filter === option.value ? 'selected' : ''}`} aria-pressed={filter === option.value} onClick={() => setFilter(option.value)}>{option.label}{option.value === 'all' && <span>{guests.length.toLocaleString('en-US')}</span>}</button>)}</div>
-          {filtered.length ? <><div className="guest-table-wrap"><table className="guest-table"><thead><tr><th scope="col">الاسم</th><th scope="col">من طرف</th><th scope="col">عدد المجموعة</th><th scope="col">الحالة</th><th scope="col">الملاحظة</th><th scope="col"><span className="sr-only">التفاصيل</span></th></tr></thead><tbody>{filtered.map((guest) => <tr key={guest.id}><td><button className="guest-name-button" onClick={() => openDetails(guest)}><span className="guest-avatar">{initials(fullName(guest))}</span><span className="guest-main-copy"><strong>{fullName(guest)}</strong><small dir="ltr">{guest.phone || 'رقم غير مضاف'}</small></span></button></td><td><span className="inviter-name">{guest.invited_by || '—'}</span></td><td><span className="party-count">{guest.family_count.toLocaleString('en-US')} <small>أفراد</small></span></td><td><StatusBadge status={guest.status} /></td><td><span className="table-note">{guest.latest_note || '—'}</span></td><td><button className="row-open" aria-label={`عرض ${fullName(guest)}`} onClick={() => openDetails(guest)}><MoreHorizontal size={19} /></button></td></tr>)}</tbody></table></div><div className="guest-cards">{filtered.map((guest) => <GuestCard key={guest.id} guest={guest} onOpen={() => openDetails(guest)} onStatus={(outcome) => { setSelectedId(guest.id); void recordContact(guest, outcome, guest.latest_note || '') }} />)}</div><div className="table-footer"><span>عرض <strong>{filtered.length.toLocaleString('en-US')}</strong> من <strong>{guests.length.toLocaleString('en-US')}</strong> اسم</span><span className="table-footer-right"><span className="live-marker" />{demo ? 'محفوظ على هذا الهاتف' : realtime ? 'مزامنة مباشرة' : 'يتم تحديث البيانات'}</span></div></> : <EmptyState hasGuests={guests.length > 0} onAdd={openAdd} onReset={() => { setFilter('all'); setInviterFilter('all'); setSortBy('updated'); setSearch('') }} />}
-        </section>
-        <footer className="page-footer"><span><ShieldCheck size={14} />{demo ? 'بيانات عرض محفوظة محلياً' : 'لا يوجد تسجيل دخول · رمز واحد للعائلة'}</span><span>دفتر العزيمة <span className="footer-separator">·</span> {family?.name}</span></footer>
-      </main>
-    </div>
-    <div className="mobile-action-bar"><div><span className="mobile-action-count">{partySize(guests).toLocaleString('en-US')}</span><span>معزوم في المجموع</span></div><button onClick={openAdd}><Plus size={19} />إضافة اسم</button></div>
+  return <div className="turki-app" dir="rtl">
+    <header className="turki-header"><div className="brand-lockup"><span className="brand-mark"><HeartHandshake size={23} /></span><strong className="brand-name">{APP_NAME}</strong></div><div className="header-actions"><span className={`sync-indicator ${realtime ? 'online' : 'offline'}`} role="status"><span className="sync-dot" />{realtime ? 'متصل' : loading ? 'جارٍ الفتح' : 'جارٍ الاتصال'}</span><button className="icon-button" aria-label="مشاركة رابط العائلة" onClick={shareFamily}><Share2 size={19} /></button></div></header>
+    <main className="turki-main" aria-busy={loading}>
+      <section className="turki-heading"><h1>المعازيم<span>{guests.length.toLocaleString('en-US')} اسم</span></h1><div className="heading-actions"><button className="secondary-button export-button" disabled={!filtered.length} onClick={() => downloadCsv(filtered)}><ArrowDownToLine size={17} />تنزيل</button><button className="primary-button" onClick={openAdd} disabled={!family || loading}><Plus size={19} />إضافة معزوم</button></div></section>
+      {error && !dialog && <div className="inline-alert" role="alert"><CircleHelp size={18} /><span>{error}</span><button aria-label="إعادة الاتصال" onClick={() => setReloadKey((value) => value + 1)}><RefreshCw size={18} /></button></div>}
+      <section className="stats-grid" aria-label="أعداد المعازيم"><StatCard icon={<Users size={18} />} label="إجمالي الأشخاص" value={partySize(guests)} detail={`${guests.length} اسم وعائلة`} tone="ink" /><StatCard icon={<CheckCheck size={18} />} label="تمت عزيمتهم" value={partySize(guests.filter((guest) => guest.status === 'invited'))} detail={`${count('invited')} اسم`} tone="green" /><StatCard icon={<Clock3 size={18} />} label="بانتظار العزيمة" value={partySize(guests.filter((guest) => guest.status === 'not_contacted'))} detail={`${count('not_contacted')} اسم`} tone="amber" /><StatCard icon={<PhoneMissed size={18} />} label="لم يردوا" value={partySize(guests.filter((guest) => guest.status === 'no_answer'))} detail={`${count('no_answer')} اسم`} tone="rose" /></section>
+      <section className="list-section turki-list" id="guest-list" aria-label="قائمة المعازيم">
+        <div className="list-toolbar"><div className="search-box"><Search size={21} /><input type="search" aria-label="ابحث عن معزوم" placeholder="ابحث بالاسم أو الهاتف أو من طرف…" value={search} onChange={(event) => setSearch(event.target.value)} />{search && <button aria-label="مسح البحث" onClick={() => setSearch('')}><X size={17} /></button>}</div><div className="toolbar-selects"><label className="compact-select"><select aria-label="تصفية حسب الشخص" value={inviterFilter} onChange={(event) => setInviterFilter(event.target.value as FamilyContact | 'all' | '')}><option value="all">كل الأشخاص</option>{FAMILY_CONTACTS.map((person) => <option key={person} value={person}>من طرف {person}</option>)}<option value="">غير محدد</option></select><ChevronDown size={15} /></label><label className="compact-select"><select aria-label="ترتيب القائمة" value={sortBy} onChange={(event) => { const next = event.target.value as SortBy; setSortBy(next); setDescending(next === 'updated' || next === 'group') }}><option value="updated">آخر تحديث</option><option value="name">الاسم</option><option value="group">عدد الأشخاص</option><option value="inviter">من طرف</option><option value="status">حالة العزيمة</option></select><ChevronDown size={15} /></label><button className="sort-direction" aria-label={descending ? 'ترتيب تنازلي؛ اضغط للتصاعدي' : 'ترتيب تصاعدي؛ اضغط للتنازلي'} title={descending ? 'تنازلي' : 'تصاعدي'} aria-pressed={descending} onClick={() => setDescending((value) => !value)}><ArrowDownUp size={18} /><span>{descending ? 'تنازلي' : 'تصاعدي'}</span></button></div></div>
+        <div className="filter-row" role="group" aria-label="تصفية حسب الحالة">{filters.map((option) => <button key={option.value} className={`filter-chip ${filter === option.value ? 'selected' : ''}`} aria-pressed={filter === option.value} onClick={() => setFilter(option.value)}>{option.label}<span>{option.value === 'all' ? guests.length : count(option.value)}</span></button>)}</div>
+        <div className="results-summary"><span><ListFilter size={15} /><strong>{filtered.length}</strong> اسم <i /> <strong>{partySize(filtered)}</strong> شخص</span><div>{hasFilters && <button onClick={clearFilters}>مسح التصفية <X size={13} /></button>}<button onClick={() => setReloadKey((value) => value + 1)} disabled={loading} aria-label="تحديث القائمة"><RefreshCw size={15} className={loading ? 'spinning' : ''} /></button></div></div>
+        {loading ? <div className="list-loading" role="status"><span className="loader" />جارٍ فتح القائمة…</div> : !family ? <div className="empty-state"><CircleHelp size={28} /><h3>تعذر فتح قائمة العائلة</h3><button className="secondary-button" onClick={() => setReloadKey((value) => value + 1)}>إعادة المحاولة <RefreshCw size={16} /></button></div> : filtered.length ? <><div className="guest-table-wrap"><table className="guest-table"><thead><tr><th scope="col">المعزوم</th><th scope="col">من طرف</th><th scope="col">الأشخاص</th><th scope="col">حالة العزيمة</th><th scope="col"><span className="sr-only">التفاصيل</span></th></tr></thead><tbody>{visibleGuests.map((guest) => <tr key={guest.id}><td><button className="guest-name-button" onClick={() => openDetails(guest)}><span className="guest-avatar">{initials(fullName(guest))}</span><span className="guest-main-copy"><strong>{fullName(guest)}</strong><small dir="ltr">{guest.phone || 'بدون رقم هاتف'}</small></span></button></td><td>{guest.invited_by || 'غير محدد'}</td><td><span className="party-count">{guest.family_count}</span></td><td><StatusBadge status={guest.status} /></td><td><button className="row-open" aria-label={`تفاصيل ${fullName(guest)}`} onClick={() => openDetails(guest)}><MoreHorizontal size={20} /></button></td></tr>)}</tbody></table></div><div className="guest-cards">{visibleGuests.map((guest) => <GuestCard key={guest.id} guest={guest} pending={pendingIds.has(guest.id)} onOpen={() => openDetails(guest)} onStatus={(outcome) => { void recordContact(guest, outcome, '') }} />)}</div>{visibleLimit < filtered.length && <button className="load-more" onClick={() => setVisibleLimit((value) => value + 50)}>عرض 50 اسماً إضافياً <ChevronDown size={17} /></button>}<div className="table-footer">عرض {visibleGuests.length} من {filtered.length} اسم</div></> : <div className="empty-state"><span className="empty-icon">{hasFilters ? <Search size={25} /> : <Users size={25} />}</span><h3>{hasFilters ? 'لا توجد نتائج مطابقة' : 'قائمة المعازيم فارغة'}</h3>{hasFilters ? <button className="secondary-button" onClick={clearFilters}>مسح البحث والتصفية</button> : <button className="primary-button" onClick={openAdd}><Plus size={18} />إضافة أول معزوم</button>}</div>}
+      </section>
+    </main>
+    <div className="mobile-action-bar"><div><strong className="mobile-action-count">{partySize(guests)}</strong><span>إجمالي الأشخاص</span></div><button onClick={openAdd} disabled={!family || loading}><Plus size={20} />إضافة معزوم</button></div>
     {dialog === 'add' && <GuestFormDialog title="إضافة معزوم" initial={null} onClose={() => { setDialog(null); setError('') }} onSave={(draft) => saveGuest(draft)} error={error} clearError={() => setError('')} />}
-    {dialog === 'edit' && selected && <GuestFormDialog title="تعديل الاسم" initial={selected} onClose={() => { setDialog('details'); setError('') }} onSave={(draft) => saveGuest(draft, selected.id)} error={error} clearError={() => setError('')} />}
+    {dialog === 'edit' && selected && <GuestFormDialog title="تعديل المعزوم" initial={selected} onClose={() => { setDialog('details'); setError('') }} onSave={(draft) => saveGuest(draft, selected.id)} error={error} clearError={() => setError('')} />}
     {dialog === 'details' && selected && <GuestDetailsDialog guest={selected} events={selectedEvents} onClose={() => { setDialog(null); setError('') }} onEdit={() => setDialog('edit')} onRecord={recordContact} error={error} clearError={() => setError('')} />}
-    {toast && <div className="toast" role="status" aria-live="polite"><span className="toast-check"><Check size={15} /></span>{toast}</div>}
+    {toast && <div className="toast" role="status" aria-live="polite"><span className="toast-check"><Check size={16} /></span>{toast}</div>}
   </div>
 }
 
@@ -311,29 +218,8 @@ function StatusBadge({ status }: { status: GuestStatus }) {
   return <span className={`status-badge status-${STATUS_META[status].tone}`}><i />{STATUS_META[status].label}</span>
 }
 
-function GuestCard({ guest, onOpen, onStatus }: { guest: Guest; onOpen: () => void; onStatus: (outcome: ContactOutcome) => void }) {
-  return <article className="guest-card"><div className="guest-card-head"><button className="guest-card-person" onClick={onOpen}><span className="guest-avatar">{initials(fullName(guest))}</span><span className="guest-main-copy"><strong>{fullName(guest)}</strong><small dir="ltr">{guest.phone || 'لا يوجد رقم'}</small></span></button><StatusBadge status={guest.status} /></div><div className="guest-card-details"><span><small>من طرف</small><strong>{guest.invited_by || '—'}</strong></span><span><small>عدد المجموعة</small><strong>{guest.family_count.toLocaleString('en-US')} أفراد</strong></span><span><small>ملاحظة</small><strong>{guest.latest_note || '—'}</strong></span></div><div className="guest-card-actions"><button className={`quick-status ${guest.status === 'invited' ? 'done' : ''}`} onClick={() => onStatus('invited')}><Check size={14} />تمت العزيمة</button><button className={`quick-status ${guest.status === 'no_answer' ? 'missed' : ''}`} onClick={() => onStatus('no_answer')}><PhoneMissed size={14} />لم يرد</button><button className="card-secondary" onClick={onOpen}>ملاحظة <ChevronLeft size={14} /></button>{guest.phone && <a className="card-call" href={`tel:${guest.phone}`} aria-label={`اتصال بـ ${fullName(guest)}`}><Phone size={14} /></a>}</div></article>
-}
-
-function EmptyState({ hasGuests, onAdd, onReset }: { hasGuests: boolean; onAdd: () => void; onReset: () => void }) {
-  return <div className="empty-state"><span className="empty-icon">{hasGuests ? <Search size={23} /> : <Users size={23} />}</span><h3>{hasGuests ? 'لا توجد أسماء هنا' : 'ابدأوا بأول اسم'}</h3><p>{hasGuests ? 'غيّر البحث أو التصفية لإظهار بقية القائمة.' : 'أدخل الاسم، وعدد المعازيم من عائلته، ثم تابعوا العزيمة.'}</p>{hasGuests ? <button className="secondary-button" onClick={onReset}>مسح البحث والتصفية</button> : <button className="primary-button" onClick={onAdd}><Plus size={17} />إضافة اسم</button>}</div>
-}
-
-function LoadingScreen() {
-  return <div className="loading-screen" dir="rtl"><div className="loading-mark"><ClipboardCheck size={24} /></div><div className="loading-copy"><strong>دفتر العزيمة</strong><span>جاري فتح الدفتر المشترك...</span></div><span className="loader" /></div>
-}
-
-function FamilySetup({ onCreate, onJoin, error, clearError }: { onCreate: (name: string) => Promise<boolean>; onJoin: (code: string) => Promise<boolean>; error: string; clearError: () => void }) {
-  const [mode, setMode] = useState<'create' | 'join'>('create')
-  const [familyName, setFamilyName] = useState('')
-  const [code, setCode] = useState('')
-  const [busy, setBusy] = useState(false)
-  const submit = async (event: FormEvent) => {
-    event.preventDefault(); setBusy(true); clearError()
-    await (mode === 'create' ? onCreate(familyName.trim()) : onJoin(code.trim()))
-    setBusy(false)
-  }
-  return <div className="setup-page" dir="rtl"><header className="setup-top"><div className="brand-lockup"><div className="brand-mark"><ClipboardCheck size={21} /></div><div><div className="brand-name">دفتر العزيمة</div><div className="brand-caption">من غير تسجيل دخول</div></div></div></header><main className="setup-card"><span className="setup-icon"><HeartHandshake size={24} /></span><div className="eyebrow"><span className="eyebrow-line" />دفتر واحد للعائلة</div><h1>{mode === 'create' ? 'ابدأ دفتر العائلة' : 'انضم إلى دفتر العائلة'}</h1><p>{mode === 'create' ? 'اكتب اسم العائلة. سننشئ رابطاً خاصاً تشاركه مع بقية العائلة.' : 'الصق رابط أو رمز الدفتر الذي أرسله لك أحد أفراد العائلة.'}</p><div className="setup-tabs" role="tablist"><button role="tab" aria-selected={mode === 'create'} className={mode === 'create' ? 'selected' : ''} onClick={() => { setMode('create'); clearError() }}>دفتر جديد</button><button role="tab" aria-selected={mode === 'join'} className={mode === 'join' ? 'selected' : ''} onClick={() => { setMode('join'); clearError() }}>عندي رمز</button></div><form className="setup-form" onSubmit={submit}>{mode === 'create' ? <label>اسم الدفتر<input value={familyName} onChange={(event) => setFamilyName(event.target.value)} placeholder="مثال: عائلة السالم" minLength={2} maxLength={100} required /></label> : <label>رمز أو رابط الدفتر<input dir="ltr" className="code-input" value={code} onChange={(event) => { const value = event.target.value; try { const parsed = new URL(value); setCode(new URLSearchParams(parsed.hash.slice(1)).get('join') || value) } catch { setCode(new URLSearchParams(value.replace(/^#/, '')).get('join') || value) } }} placeholder="الصق رابط الدعوة أو الرمز" required /></label>}{error && <div className="form-alert" role="alert">{error}</div>}<button className="primary-button auth-submit" disabled={busy}>{busy ? <span className="button-spinner" /> : <>{mode === 'create' ? 'إنشاء الدفتر' : 'فتح دفتر العائلة'}<ArrowLeft size={17} /></>}</button></form><div className="setup-footnote"><ShieldCheck size={15} /><span>لا حساب ولا كلمة مرور. يُحفظ رمز العائلة على هذا الجهاز لفتح الدفتر لاحقاً.</span></div></main></div>
+function GuestCard({ guest, pending, onOpen, onStatus }: { guest: Guest; pending: boolean; onOpen: () => void; onStatus: (outcome: ContactOutcome) => void }) {
+  return <article className="guest-card"><div className="guest-card-head"><button className="guest-card-person" onClick={onOpen}><span className="guest-avatar">{initials(fullName(guest))}</span><span className="guest-main-copy"><strong>{fullName(guest)}</strong><small dir="ltr">{guest.phone || 'بدون رقم هاتف'}</small></span></button><StatusBadge status={guest.status} /></div><div className="guest-card-meta"><span>من طرف <strong>{guest.invited_by || 'غير محدد'}</strong></span><span><Users size={14} /><strong>{guest.family_count}</strong> أشخاص</span></div><div className="guest-card-actions"><button disabled={pending || guest.status === 'invited'} className={`quick-status ${guest.status === 'invited' ? 'done' : ''}`} onClick={() => onStatus('invited')}><Check size={15} />تمت العزيمة</button><button disabled={pending || guest.status === 'no_answer'} className={`quick-status ${guest.status === 'no_answer' ? 'missed' : ''}`} onClick={() => onStatus('no_answer')}><PhoneMissed size={15} />لم يرد</button><button className="card-secondary" onClick={onOpen} aria-label={`تفاصيل ${fullName(guest)}`}><MoreHorizontal size={19} /></button>{guest.phone && <a className="card-call" href={`tel:${guest.phone}`} aria-label={`اتصال بـ ${fullName(guest)}`}><Phone size={16} /></a>}</div></article>
 }
 
 function useDialog(ref: React.RefObject<HTMLDialogElement | null>, onClose: () => void) {
@@ -343,9 +229,10 @@ function useDialog(ref: React.RefObject<HTMLDialogElement | null>, onClose: () =
     const dialog = ref.current
     if (!dialog) return
     if (!dialog.open) dialog.showModal()
+    dialog.querySelector<HTMLInputElement>('[data-initial-focus]')?.focus()
     const close = () => onCloseRef.current()
     dialog.addEventListener('close', close)
-    return () => { dialog.removeEventListener('close', close); if (dialog.open) dialog.close() }
+    return () => { dialog.removeEventListener('close', close) }
   }, [ref])
 }
 
@@ -360,12 +247,12 @@ function GuestFormDialog({ title, initial, onClose, onSave, error, clearError }:
   useDialog(dialogRef, onClose)
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setBusy(true)
-    const saved = await onSave({ first_name: firstName.trim(), last_name: lastName.trim(), phone: phone.trim(), family_count: Math.max(1, Math.min(500, Number(familyCount) || 1)), invited_by: invitedBy })
+    const saved = await onSave({ first_name: firstName.trim(), last_name: lastName.trim(), phone: phone.trim(), family_count: Math.max(1, Math.min(500, Math.trunc(Number(familyCount)) || 1)), invited_by: invitedBy })
     setBusy(false); if (saved) clearError()
   }
   const clearVisibleError = () => { if (error) clearError() }
   return <dialog className="app-dialog guest-form-dialog" ref={dialogRef} onCancel={(event) => { event.preventDefault(); onClose() }} onClick={(event) => { if (event.target === dialogRef.current) onClose() }}><div className="dialog-header"><div><span className="dialog-eyebrow">سريع وسهل</span><h2>{title}</h2><p>الاسم فقط يكفي. باقي المعلومات اختيارية.</p></div><button className="icon-button" aria-label="إغلاق" onClick={onClose}><X size={19} /></button></div><form className="guest-form" onSubmit={submit}>
-    <div className="name-fields"><label>الاسم <span className="required-mark">*</span><input autoFocus value={firstName} onChange={(event) => { setFirstName(event.target.value); clearVisibleError() }} placeholder="الاسم الأول" required minLength={1} maxLength={80} /></label><label>اللقب <span className="optional-label">اختياري</span><input value={lastName} onChange={(event) => { setLastName(event.target.value); clearVisibleError() }} placeholder="اسم العائلة" maxLength={100} /></label></div>
+    <div className="name-fields"><label>الاسم <span className="required-mark">*</span><input data-initial-focus autoFocus value={firstName} onChange={(event) => { setFirstName(event.target.value); clearVisibleError() }} placeholder="الاسم الأول" required minLength={1} maxLength={80} /></label><label>اللقب <span className="optional-label">اختياري</span><input value={lastName} onChange={(event) => { setLastName(event.target.value); clearVisibleError() }} placeholder="اسم العائلة" maxLength={100} /></label></div>
     <div className="phone-count-fields"><label>رقم الهاتف <span className="optional-label">اختياري</span><div className="phone-input"><Phone size={16} /><input type="tel" dir="ltr" value={phone} onChange={(event) => { setPhone(event.target.value); clearVisibleError() }} placeholder="09X XXX XXXX" /></div></label><label>عدد المعازيم من عائلته<div className="stepper-input"><button type="button" aria-label="إنقاص العدد" onClick={() => setFamilyCount((value) => String(Math.max(1, (Number(value) || 1) - 1)))}>−</button><input type="number" min="1" max="500" inputMode="numeric" value={familyCount} onChange={(event) => setFamilyCount(event.target.value)} /><button type="button" aria-label="زيادة العدد" onClick={() => setFamilyCount((value) => String(Math.min(500, (Number(value) || 1) + 1)))}>+</button></div><small>يشمل المعزوم نفسه</small></label></div>
     <fieldset className="inviter-fieldset"><legend>من طرف <span className="optional-label">اختياري</span></legend><div className="inviter-options">{FAMILY_CONTACTS.map((person) => <button type="button" key={person} className={`inviter-option ${invitedBy === person ? 'selected' : ''}`} aria-pressed={invitedBy === person} onClick={() => setInvitedBy((value) => value === person ? '' : person)}>{invitedBy === person && <Check size={13} />}{person}</button>)}</div></fieldset>
     {error && <div className="form-alert" role="alert">{error}</div>}

@@ -1,4 +1,4 @@
--- Password-free shared guest book. Each family receives a high-entropy shared code.
+-- Shared guest book for Afrah Turki. No login or changes to existing security settings.
 create extension if not exists pgcrypto with schema extensions;
 
 create or replace function public.normalize_guest_name(p_value text)
@@ -101,6 +101,24 @@ as $$
   limit 1;
 $$;
 
+-- One shared book for this family; phones open it without an account or setup.
+create or replace function public.open_turki_book()
+returns table (id uuid, name text, realtime_topic text)
+language plpgsql security definer
+set search_path = public, extensions
+as $$
+declare
+  v_hash text := encode(extensions.digest('turki-family-shared-book-2026', 'sha256'), 'hex');
+begin
+  perform pg_advisory_xact_lock(hashtextextended('turki-family-shared-book-2026', 0));
+  insert into public.families (name, access_hash, realtime_topic)
+    values ('أفراح عائلة التركي', v_hash, encode(extensions.gen_random_bytes(24), 'hex'))
+    on conflict (access_hash) do nothing;
+  return query select f.id, f.name, 'family-' || f.realtime_topic
+    from public.families f where f.access_hash = v_hash;
+end;
+$$;
+
 create or replace function public.list_guests(p_access_code text)
 returns setof public.guests
 language plpgsql security definer
@@ -126,6 +144,23 @@ begin
     where f.access_hash = encode(extensions.digest(lower(btrim(coalesce(p_access_code, ''))), 'sha256'), 'hex');
   if v_family_id is null then raise exception 'INVALID_ACCESS_CODE'; end if;
   return query select a.* from public.guest_activities a where a.family_id = v_family_id order by a.created_at desc;
+end;
+$$;
+
+-- Return one JSON snapshot so the Data API row limit never truncates the guest totals.
+create or replace function public.get_turki_snapshot(p_access_code text)
+returns jsonb language plpgsql security definer
+set search_path = public, extensions
+as $$
+declare v_family_id uuid;
+begin
+  select f.id into v_family_id from public.families f
+    where f.access_hash = encode(extensions.digest(lower(btrim(coalesce(p_access_code, ''))), 'sha256'), 'hex');
+  if v_family_id is null then raise exception 'INVALID_ACCESS_CODE'; end if;
+  return jsonb_build_object(
+    'guests', coalesce((select jsonb_agg(g order by g.updated_at desc, g.id) from public.guests g where g.family_id = v_family_id), '[]'::jsonb),
+    'activities', coalesce((select jsonb_agg(a order by a.created_at desc, a.id) from public.guest_activities a where a.family_id = v_family_id), '[]'::jsonb)
+  );
 end;
 $$;
 
@@ -223,7 +258,7 @@ begin
 end;
 $$;
 
--- Realtime only reveals that the shared book changed. Guest data remains behind the secret-code RPCs.
+-- Broadcast a refresh event after a change; the event contains no guest details.
 create or replace function public.broadcast_family_change()
 returns trigger language plpgsql security definer
 set search_path = public, extensions, realtime
