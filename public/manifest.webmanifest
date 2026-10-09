@@ -1,0 +1,14 @@
+{
+  "name": "دفتر العزيمة — إدارة ضيوف العرس",
+  "short_name": "دفتر العزيمة",
+  "description": "قائمة دعوات عائلية مشتركة مع سجل متابعة لكل ضيف.",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f2ed",
+  "theme_color": "#222636",
+  "icons": [
+    { "src": "/pwa-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
